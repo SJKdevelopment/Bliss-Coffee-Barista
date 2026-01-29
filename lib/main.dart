@@ -183,7 +183,7 @@ class _BaristaKDSPageState extends State<BaristaKDSPage> {
 
       if (loyaltyCode != null) {
         updateData['loyalty_redemption_code'] = null;
-        updateData['stamps_count'] = 0;
+        updateData['stamps_count'] = 0; // Reset stamps count to 0 when loyalty reward is claimed
       } else if (refCode != null) {
         updateData['redemption_code'] = null;
       }
@@ -297,7 +297,6 @@ class _BaristaKDSPageState extends State<BaristaKDSPage> {
           ],
         ),
       ),
-      floatingActionButton: _buildQuickActions(),
     );
   }
 
@@ -346,6 +345,8 @@ class _BaristaKDSPageState extends State<BaristaKDSPage> {
               ],
             ),
           ),
+          const SizedBox(width: 12),
+          _buildQuickActions(),
         ],
       ),
     );
