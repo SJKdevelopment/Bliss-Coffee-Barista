@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'dart:async';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 void main() async {
@@ -25,11 +26,125 @@ class BaristaKDSPage extends StatefulWidget {
 
 class _BaristaKDSPageState extends State<BaristaKDSPage> {
   final _supabase = Supabase.instance.client;
+  Timer? _notificationTimer;
+  Set<String> _notifiedOrders = <String>{};
 
   @override
   void initState() {
     super.initState();
     _initTerminalSettings();
+    _startNotificationTimer();
+  }
+
+  @override
+  void dispose() {
+    _notificationTimer?.cancel();
+    super.dispose();
+  }
+
+  void _startNotificationTimer() {
+    _notificationTimer = Timer.periodic(const Duration(minutes: 1), (timer) {
+      _checkScheduledPickups();
+    });
+  }
+
+  Future<void> _checkScheduledPickups() async {
+    try {
+      final now = DateTime.now();
+      final response = await _supabase
+          .from('orders')
+          .select('id, scheduled_pickup_time, customer_name, specifications')
+          .or('status.eq.paid,status.eq.preparing,status.eq.ready')
+          .not('scheduled_pickup_time', 'is', null);
+
+      for (final order in response) {
+        final String? scheduledTime = order['scheduled_pickup_time']?.toString();
+        if (scheduledTime == null) continue;
+
+        final scheduled = DateTime.tryParse(scheduledTime);
+        if (scheduled == null) continue;
+
+        final String orderId = order['id'].toString();
+        final String customerName = order['customer_name'] ?? 'Customer';
+        final diff = scheduled.difference(now);
+
+        // Check for overdue orders (past pickup time)
+        if (diff.isNegative && !_notifiedOrders.contains('${orderId}_overdue')) {
+          _showPickupNotification(
+            'Overdue Pickup!',
+            '$customerName\'s order was scheduled for ${_formatNotificationTime(scheduled)}',
+            Colors.red,
+          );
+          _notifiedOrders.add('${orderId}_overdue');
+        }
+
+        // Check for orders due in 5 minutes
+        if (diff.inMinutes <= 5 && diff.inMinutes > 0 && !_notifiedOrders.contains('${orderId}_5min')) {
+          _showPickupNotification(
+            'Pickup Soon!',
+            '$customerName\'s order is due in ${diff.inMinutes} minute${diff.inMinutes == 1 ? '' : 's'}',
+            Colors.orange,
+          );
+          _notifiedOrders.add('${orderId}_5min');
+        }
+
+        // Check for orders due in 10 minutes
+        if (diff.inMinutes <= 10 && diff.inMinutes > 5 && !_notifiedOrders.contains('${orderId}_10min')) {
+          _showPickupNotification(
+            'Upcoming Pickup',
+            '$customerName\'s order is due in ${diff.inMinutes} minutes',
+            Colors.blue,
+          );
+          _notifiedOrders.add('${orderId}_10min');
+        }
+      }
+    } catch (e) {
+      debugPrint("Error checking scheduled pickups: $e");
+    }
+  }
+
+  void _showPickupNotification(String title, String message, Color color) {
+    if (!mounted) return;
+    
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              title,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+                fontSize: 14,
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              message,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+              ),
+            ),
+          ],
+        ),
+        backgroundColor: color,
+        duration: const Duration(seconds: 5),
+        action: SnackBarAction(
+          label: 'DISMISS',
+          textColor: Colors.white,
+          onPressed: () {
+            ScaffoldMessenger.of(context).hideCurrentSnackBar();
+          },
+        ),
+      ),
+    );
+  }
+
+  String _formatNotificationTime(DateTime dateTime) {
+    return "${dateTime.hour.toString().padLeft(2, '0')}:${dateTime.minute.toString().padLeft(2, '0')}";
   }
 
   Future<void> _initTerminalSettings() async {
@@ -196,7 +311,7 @@ class _BaristaKDSPageState extends State<BaristaKDSPage> {
           const Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text("BLISS KITCHEN DISPLAY", style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)),
+              Text("COFFEE TERMINAL", style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)),
               Text("Real-time Order Management", style: TextStyle(color: Color(0xFF8B949E), fontSize: 12)),
             ],
           ),
@@ -320,6 +435,45 @@ class _BaristaKDSPageState extends State<BaristaKDSPage> {
           return isCorrectStatus && !isBulk;
         }).toList();
 
+        // Sort orders by priority: overdue -> soon -> scheduled -> ASAP (by creation time)
+        activeOrders.sort((a, b) {
+          final DateTime now = DateTime.now();
+          final String? aScheduledTime = a['scheduled_pickup_time']?.toString();
+          final String? bScheduledTime = b['scheduled_pickup_time']?.toString();
+          
+          final DateTime? aScheduled = aScheduledTime != null ? DateTime.tryParse(aScheduledTime) : null;
+          final DateTime? bScheduled = bScheduledTime != null ? DateTime.tryParse(bScheduledTime) : null;
+          
+          // Overdue orders (highest priority)
+          final bool aOverdue = aScheduled != null && now.isAfter(aScheduled);
+          final bool bOverdue = bScheduled != null && now.isAfter(bScheduled);
+          
+          if (aOverdue && !bOverdue) return -1;
+          if (!aOverdue && bOverdue) return 1;
+          if (aOverdue && bOverdue) return aScheduled!.compareTo(bScheduled!);
+          
+          // Soon orders (high priority)
+          final bool aSoon = aScheduled != null && aScheduled.difference(now).inMinutes <= 10 && aScheduled.isAfter(now);
+          final bool bSoon = bScheduled != null && bScheduled.difference(now).inMinutes <= 10 && bScheduled.isAfter(now);
+          
+          if (aSoon && !bSoon) return -1;
+          if (!aSoon && bSoon) return 1;
+          if (aSoon && bSoon) return aScheduled!.compareTo(bScheduled!);
+          
+          // Scheduled orders (medium priority)
+          final bool aScheduledOrder = aScheduled != null;
+          final bool bScheduledOrder = bScheduled != null;
+          
+          if (aScheduledOrder && !bScheduledOrder) return -1;
+          if (!aScheduledOrder && bScheduledOrder) return 1;
+          if (aScheduledOrder && bScheduledOrder) return aScheduled!.compareTo(bScheduled!);
+          
+          // ASAP orders (lowest priority) - sort by creation time
+          final DateTime aCreated = DateTime.tryParse(a['created_at'] ?? '') ?? now;
+          final DateTime bCreated = DateTime.tryParse(b['created_at'] ?? '') ?? now;
+          return aCreated.compareTo(bCreated);
+        });
+
         if (activeOrders.isEmpty) {
           return Center(
             child: Column(
@@ -353,10 +507,10 @@ class _BaristaKDSPageState extends State<BaristaKDSPage> {
               padding: const EdgeInsets.all(16),
               child: GridView.builder(
                 gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: 4,
-                  crossAxisSpacing: 16,
-                  mainAxisSpacing: 16,
-                  childAspectRatio: 0.6,
+                  crossAxisCount: 6,
+                  crossAxisSpacing: 12,
+                  mainAxisSpacing: 12,
+                  childAspectRatio: 0.45,
                 ),
                 itemCount: enrichedSnapshot.data!.length,
                 // CHANGED: Now using the Stateful Card Widget
@@ -513,10 +667,51 @@ class _OrderTicketCardState extends State<OrderTicketCard> {
     return "${diff.inMinutes}m ago";
   }
 
+  String _formatScheduledPickupTime(String? scheduledTime) {
+    if (scheduledTime == null) return "ASAP";
+    
+    final scheduled = DateTime.tryParse(scheduledTime);
+    if (scheduled == null) return "ASAP";
+    
+    final now = DateTime.now();
+    final diff = scheduled.difference(now);
+    
+    if (diff.isNegative) return "OVERDUE";
+    if (diff.inMinutes < 5) return "SOON";
+    if (diff.inMinutes < 60) return "${diff.inMinutes}m";
+    if (diff.inHours < 24) return "${diff.inHours}h ${diff.inMinutes % 60}m";
+    
+    return "${scheduled.day}/${scheduled.month} ${scheduled.hour.toString().padLeft(2, '0')}:${scheduled.minute.toString().padLeft(2, '0')}";
+  }
+
+  bool _isScheduledOrder(String? scheduledTime) {
+    return scheduledTime != null && scheduledTime.isNotEmpty;
+  }
+
+  bool _isPickupOverdue(String? scheduledTime) {
+    if (scheduledTime == null) return false;
+    final scheduled = DateTime.tryParse(scheduledTime);
+    if (scheduled == null) return false;
+    return DateTime.now().isAfter(scheduled);
+  }
+
+  bool _isPickupSoon(String? scheduledTime) {
+    if (scheduledTime == null) return false;
+    final scheduled = DateTime.tryParse(scheduledTime);
+    if (scheduled == null) return false;
+    final diff = scheduled.difference(DateTime.now());
+    return diff.inMinutes <= 10 && diff.inMinutes > 0;
+  }
+
   @override
   Widget build(BuildContext context) {
     final String timeLabel = _getTimeSinceOrder(widget.order['created_at']);
     final String orderId = "#${widget.order['id'].toString().substring(0, 6).toUpperCase()}";
+    final String? scheduledPickupTime = widget.order['scheduled_pickup_time']?.toString();
+    final String pickupTimeLabel = _formatScheduledPickupTime(scheduledPickupTime);
+    final bool isScheduled = _isScheduledOrder(scheduledPickupTime);
+    final bool isOverdue = _isPickupOverdue(scheduledPickupTime);
+    final bool isSoon = _isPickupSoon(scheduledPickupTime);
 
     final List<String> items = (widget.order['items_summary']?.toString() ?? "NEW ORDER")
         .split(',')
@@ -531,26 +726,36 @@ class _OrderTicketCardState extends State<OrderTicketCard> {
     String btnText = _currentStatus == 'preparing' ? "MARK READY" :
     (_currentStatus == 'ready' ? "COMPLETE" : "START PREP");
 
-    bool isUrgent = DateTime.now().difference(DateTime.tryParse(widget.order['created_at']) ?? DateTime.now()).inMinutes > 10;
+    // Enhanced border logic for scheduled orders
+    Color borderColor = Colors.white.withOpacity(0.1);
+    double borderWidth = 1;
+    
+    if (isOverdue) {
+      borderColor = const Color(0xFFE91E63).withOpacity(0.8);
+      borderWidth = 2;
+    } else if (isSoon) {
+      borderColor = const Color(0xFFFF9800).withOpacity(0.6);
+      borderWidth = 2;
+    }
 
     return Material(
       color: Colors.transparent,
       child: InkWell(
         onTap: _handleOptimisticUpdate, // Call the instant update function
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(8),
         child: Container(
           decoration: BoxDecoration(
             color: const Color(0xFF161B22),
-            borderRadius: BorderRadius.circular(12),
+            borderRadius: BorderRadius.circular(8),
             border: Border.all(
-              color: isUrgent ? const Color(0xFFE91E63).withOpacity(0.5) : Colors.white.withOpacity(0.1),
-              width: isUrgent ? 2 : 1,
+              color: borderColor,
+              width: borderWidth,
             ),
             boxShadow: [
               BoxShadow(
-                color: Colors.black.withOpacity(0.3),
-                blurRadius: 8,
-                offset: const Offset(0, 4),
+                color: Colors.black.withOpacity(0.2),
+                blurRadius: 4,
+                offset: const Offset(0, 2),
               ),
             ],
           ),
@@ -559,59 +764,91 @@ class _OrderTicketCardState extends State<OrderTicketCard> {
             children: [
               // Header with status
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
                 decoration: BoxDecoration(
                   color: statusColor.withOpacity(0.1),
-                  borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
+                  borderRadius: const BorderRadius.vertical(top: Radius.circular(8)),
                   border: Border(bottom: BorderSide(color: statusColor.withOpacity(0.3))),
                 ),
                 child: Row(
                   children: [
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
                       decoration: BoxDecoration(
                         color: statusColor,
-                        borderRadius: BorderRadius.circular(6),
+                        borderRadius: BorderRadius.circular(4),
                       ),
                       child: Text(
                         orderId,
                         style: const TextStyle(
                           color: Colors.white,
-                          fontSize: 14,
+                          fontSize: 10,
                           fontWeight: FontWeight.bold,
-                          letterSpacing: 1.2,
+                          letterSpacing: 0.6,
                         ),
                       ),
                     ),
                     const Spacer(),
-                    if (isUrgent)
+                    if (isOverdue)
                       Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
                         decoration: BoxDecoration(
                           color: const Color(0xFFE91E63),
-                          borderRadius: BorderRadius.circular(4),
+                          borderRadius: BorderRadius.circular(3),
                         ),
                         child: const Text(
-                          "URGENT",
+                          "OVERDUE",
                           style: TextStyle(
                             color: Colors.white,
-                            fontSize: 10,
+                            fontSize: 7,
                             fontWeight: FontWeight.bold,
                           ),
                         ),
                       ),
-                    const SizedBox(width: 8),
+                    if (isSoon && !isOverdue)
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFF9800),
+                          borderRadius: BorderRadius.circular(3),
+                        ),
+                        child: const Text(
+                          "SOON",
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 7,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    if (isScheduled && !isSoon && !isOverdue)
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF2196F3),
+                          borderRadius: BorderRadius.circular(3),
+                        ),
+                        child: const Text(
+                          "SCHEDULED",
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 7,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    const SizedBox(width: 3),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
                       decoration: BoxDecoration(
                         color: Colors.white.withOpacity(0.1),
-                        borderRadius: BorderRadius.circular(6),
+                        borderRadius: BorderRadius.circular(4),
                       ),
                       child: Text(
                         timeLabel,
                         style: TextStyle(
                           color: statusColor,
-                          fontSize: 12,
+                          fontSize: 8,
                           fontWeight: FontWeight.bold,
                         ),
                       ),
@@ -623,7 +860,7 @@ class _OrderTicketCardState extends State<OrderTicketCard> {
               // Order items
               Expanded(
                 child: Container(
-                  padding: const EdgeInsets.all(16),
+                  padding: const EdgeInsets.all(10),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -631,37 +868,37 @@ class _OrderTicketCardState extends State<OrderTicketCard> {
                         "ORDER ITEMS",
                         style: TextStyle(
                           color: const Color(0xFF8B949E),
-                          fontSize: 10,
+                          fontSize: 8,
                           fontWeight: FontWeight.w600,
-                          letterSpacing: 1.1,
+                          letterSpacing: 0.8,
                         ),
                       ),
-                      const SizedBox(height: 8),
+                      const SizedBox(height: 4),
                       Expanded(
                         child: ListView.builder(
                           itemCount: items.length,
                           itemBuilder: (context, index) {
                             return Padding(
-                              padding: const EdgeInsets.only(bottom: 6),
+                              padding: const EdgeInsets.only(bottom: 3),
                               child: Row(
                                 children: [
                                   Container(
-                                    width: 4,
-                                    height: 4,
+                                    width: 3,
+                                    height: 3,
                                     decoration: BoxDecoration(
                                       color: statusColor,
                                       shape: BoxShape.circle,
                                     ),
                                   ),
-                                  const SizedBox(width: 8),
+                                  const SizedBox(width: 6),
                                   Expanded(
                                     child: Text(
                                       items[index].toUpperCase(),
                                       style: const TextStyle(
                                         color: Colors.white,
-                                        fontSize: 14,
+                                        fontSize: 10,
                                         fontWeight: FontWeight.w600,
-                                        letterSpacing: 0.5,
+                                        letterSpacing: 0.3,
                                       ),
                                     ),
                                   ),
@@ -671,30 +908,125 @@ class _OrderTicketCardState extends State<OrderTicketCard> {
                           },
                         ),
                       ),
-                      const SizedBox(height: 8),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.05),
-                          borderRadius: BorderRadius.circular(6),
-                        ),
-                        child: Row(
+                      const SizedBox(height: 4),
+                      // Customer info row
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withOpacity(0.05),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Row(
+                                children: [
+                                  const Icon(Icons.person, color: Color(0xFF8B949E), size: 14),
+                                  const SizedBox(width: 5),
+                                  Expanded(
+                                    child: Text(
+                                      widget.order['customer_name'] ?? 'GUEST',
+                                      style: const TextStyle(
+                                        color: Color(0xFF8B949E),
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      // Specifications row (if present)
+                      if (widget.order['specifications'] != null && widget.order['specifications'].toString().trim().isNotEmpty)
+                        Row(
                           children: [
-                            const Icon(Icons.person, color: Color(0xFF8B949E), size: 12),
-                            const SizedBox(width: 4),
                             Expanded(
-                              child: Text(
-                                widget.order['customer_name'] ?? 'GUEST',
-                                style: const TextStyle(
-                                  color: Color(0xFF8B949E),
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.w500,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFFFF9800).withOpacity(0.15),
+                                  borderRadius: BorderRadius.circular(4),
+                                  border: Border.all(color: const Color(0xFFFF9800).withOpacity(0.3)),
                                 ),
-                                overflow: TextOverflow.ellipsis,
+                                child: Row(
+                                  children: [
+                                    const Icon(Icons.info_outline, color: Color(0xFFFF9800), size: 14),
+                                    const SizedBox(width: 5),
+                                    Expanded(
+                                      child: Text(
+                                        "SPEC: ${widget.order['specifications'].toString().trim()}",
+                                        style: const TextStyle(
+                                          color: Color(0xFFFF9800),
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                        overflow: TextOverflow.ellipsis,
+                                        maxLines: 4,
+                                      ),
+                                    ),
+                                  ],
+                                ),
                               ),
                             ),
                           ],
                         ),
+                      const SizedBox(height: 3),
+                      // Pickup time row
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: isScheduled 
+                                    ? (isOverdue ? const Color(0xFFE91E63).withOpacity(0.2) 
+                                       : isSoon ? const Color(0xFFFF9800).withOpacity(0.2) 
+                                       : const Color(0xFF2196F3).withOpacity(0.2))
+                                    : Colors.white.withOpacity(0.05),
+                                borderRadius: BorderRadius.circular(4),
+                                border: isScheduled ? Border.all(
+                                  color: isOverdue ? const Color(0xFFE91E63).withOpacity(0.5)
+                                       : isSoon ? const Color(0xFFFF9800).withOpacity(0.5)
+                                       : const Color(0xFF2196F3).withOpacity(0.5),
+                                ) : null,
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    isScheduled ? Icons.schedule : Icons.flash_on,
+                                    color: isScheduled 
+                                        ? (isOverdue ? const Color(0xFFE91E63)
+                                           : isSoon ? const Color(0xFFFF9800)
+                                           : const Color(0xFF2196F3))
+                                        : const Color(0xFF8B949E),
+                                    size: 10,
+                                  ),
+                                  const SizedBox(width: 3),
+                                  Expanded(
+                                    child: Text(
+                                      "PICKUP: $pickupTimeLabel",
+                                      style: TextStyle(
+                                        color: isScheduled 
+                                            ? (isOverdue ? const Color(0xFFE91E63)
+                                               : isSoon ? const Color(0xFFFF9800)
+                                               : const Color(0xFF2196F3))
+                                            : const Color(0xFF8B949E),
+                                        fontSize: 8,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
@@ -703,10 +1035,10 @@ class _OrderTicketCardState extends State<OrderTicketCard> {
 
               // Action button area
               Container(
-                height: 56,
+                height: 40,
                 decoration: BoxDecoration(
                   color: statusColor.withOpacity(0.15),
-                  borderRadius: const BorderRadius.vertical(bottom: Radius.circular(12)),
+                  borderRadius: const BorderRadius.vertical(bottom: Radius.circular(8)),
                   border: Border(top: BorderSide(color: statusColor.withOpacity(0.3))),
                 ),
                 child: Center(
@@ -717,16 +1049,16 @@ class _OrderTicketCardState extends State<OrderTicketCard> {
                         _currentStatus == 'preparing' ? Icons.check_circle :
                         _currentStatus == 'ready' ? Icons.done_all : Icons.play_arrow,
                         color: statusColor,
-                        size: 18,
+                        size: 14,
                       ),
-                      const SizedBox(width: 6),
+                      const SizedBox(width: 4),
                       Text(
                         btnText,
                         style: TextStyle(
                           color: statusColor,
                           fontWeight: FontWeight.bold,
-                          fontSize: 14,
-                          letterSpacing: 0.8,
+                          fontSize: 10,
+                          letterSpacing: 0.6,
                         ),
                       ),
                     ],
