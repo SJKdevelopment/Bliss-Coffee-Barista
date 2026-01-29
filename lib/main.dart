@@ -25,7 +25,8 @@ class BaristaKDSPage extends StatefulWidget {
 }
 
 class _BaristaKDSPageState extends State<BaristaKDSPage> {
-  final _supabase = Supabase.instance.client;
+  final SupabaseClient _supabase = Supabase.instance.client;
+  Timer? _refreshTimer;
   Timer? _notificationTimer;
   Set<String> _notifiedOrders = <String>{};
 
@@ -34,11 +35,18 @@ class _BaristaKDSPageState extends State<BaristaKDSPage> {
     super.initState();
     _initTerminalSettings();
     _startNotificationTimer();
+    // Start a timer to refresh the UI every minute for time-based filtering
+    _refreshTimer = Timer.periodic(const Duration(minutes: 1), (timer) {
+      if (mounted) {
+        setState(() {});
+      }
+    });
   }
 
   @override
   void dispose() {
     _notificationTimer?.cancel();
+    _refreshTimer?.cancel();
     super.dispose();
   }
 
@@ -63,16 +71,19 @@ class _BaristaKDSPageState extends State<BaristaKDSPage> {
 
         final scheduled = DateTime.tryParse(scheduledTime);
         if (scheduled == null) continue;
+        
+        // Convert UTC database time to local time automatically
+        final DateTime scheduledLocal = scheduled.toLocal();
 
         final String orderId = order['id'].toString();
         final String customerName = order['customer_name'] ?? 'Customer';
-        final diff = scheduled.difference(now);
+        final diff = scheduledLocal.difference(now);
 
         // Check for overdue orders (past pickup time)
         if (diff.isNegative && !_notifiedOrders.contains('${orderId}_overdue')) {
           _showPickupNotification(
             'Overdue Pickup!',
-            '$customerName\'s order was scheduled for ${_formatNotificationTime(scheduled)}',
+            '$customerName\'s order was scheduled for ${_formatNotificationTime(scheduledLocal)}',
             Colors.red,
           );
           _notifiedOrders.add('${orderId}_overdue');
@@ -432,7 +443,25 @@ class _BaristaKDSPageState extends State<BaristaKDSPage> {
           final String status = order['status']?.toString().toLowerCase() ?? 'pending';
           final bool isCorrectStatus = ['paid', 'preparing', 'ready'].contains(status);
           final bool isBulk = order['is_bulk'] == true;
-          return isCorrectStatus && !isBulk;
+          
+          if (!isCorrectStatus || isBulk) return false;
+          
+          // Check if order has a scheduled pickup time
+          final String? scheduledTime = order['scheduled_pickup_time']?.toString();
+          if (scheduledTime != null && scheduledTime.isNotEmpty) {
+            final DateTime? scheduled = DateTime.tryParse(scheduledTime);
+            if (scheduled != null) {
+              // Convert UTC database time to local time automatically (same as display)
+              final DateTime scheduledLocal = scheduled.toLocal().subtract(const Duration(hours: 2));
+              final DateTime now = DateTime.now();
+              final diff = scheduledLocal.difference(now);
+              // Only show scheduled orders if they are within 30 minutes or overdue
+              return diff.inMinutes <= 30 || diff.isNegative;
+            }
+          }
+          
+          // Show ASAP orders (no scheduled time)
+          return true;
         }).toList();
 
         // Sort orders by priority: overdue -> soon -> scheduled -> ASAP (by creation time)
@@ -441,8 +470,8 @@ class _BaristaKDSPageState extends State<BaristaKDSPage> {
           final String? aScheduledTime = a['scheduled_pickup_time']?.toString();
           final String? bScheduledTime = b['scheduled_pickup_time']?.toString();
           
-          final DateTime? aScheduled = aScheduledTime != null ? DateTime.tryParse(aScheduledTime) : null;
-          final DateTime? bScheduled = bScheduledTime != null ? DateTime.tryParse(bScheduledTime) : null;
+          final DateTime? aScheduled = aScheduledTime != null ? DateTime.tryParse(aScheduledTime)?.toLocal() : null;
+          final DateTime? bScheduled = bScheduledTime != null ? DateTime.tryParse(bScheduledTime)?.toLocal() : null;
           
           // Overdue orders (highest priority)
           final bool aOverdue = aScheduled != null && now.isAfter(aScheduled);
@@ -670,18 +699,11 @@ class _OrderTicketCardState extends State<OrderTicketCard> {
   String _formatScheduledPickupTime(String? scheduledTime) {
     if (scheduledTime == null) return "ASAP";
     
-    final scheduled = DateTime.tryParse(scheduledTime);
-    if (scheduled == null) return "ASAP";
+    // Convert UTC database time to local time automatically
+    final DateTime scheduled = DateTime.tryParse(scheduledTime)!;
+    final DateTime scheduledLocal = scheduled.toLocal().subtract(const Duration(hours: 2));
     
-    final now = DateTime.now();
-    final diff = scheduled.difference(now);
-    
-    if (diff.isNegative) return "OVERDUE";
-    if (diff.inMinutes < 5) return "SOON";
-    if (diff.inMinutes < 60) return "${diff.inMinutes}m";
-    if (diff.inHours < 24) return "${diff.inHours}h ${diff.inMinutes % 60}m";
-    
-    return "${scheduled.day}/${scheduled.month} ${scheduled.hour.toString().padLeft(2, '0')}:${scheduled.minute.toString().padLeft(2, '0')}";
+    return "${scheduledLocal.day}/${scheduledLocal.month} ${scheduledLocal.hour.toString().padLeft(2, '0')}:${scheduledLocal.minute.toString().padLeft(2, '0')}";
   }
 
   bool _isScheduledOrder(String? scheduledTime) {
@@ -692,14 +714,18 @@ class _OrderTicketCardState extends State<OrderTicketCard> {
     if (scheduledTime == null) return false;
     final scheduled = DateTime.tryParse(scheduledTime);
     if (scheduled == null) return false;
-    return DateTime.now().isAfter(scheduled);
+    // Convert UTC database time to local time automatically
+    final DateTime scheduledLocal = scheduled.toLocal();
+    return DateTime.now().isAfter(scheduledLocal);
   }
 
   bool _isPickupSoon(String? scheduledTime) {
     if (scheduledTime == null) return false;
     final scheduled = DateTime.tryParse(scheduledTime);
     if (scheduled == null) return false;
-    final diff = scheduled.difference(DateTime.now());
+    // Convert UTC database time to local time automatically
+    final DateTime scheduledLocal = scheduled.toLocal();
+    final diff = scheduledLocal.difference(DateTime.now());
     return diff.inMinutes <= 10 && diff.inMinutes > 0;
   }
 
@@ -928,7 +954,7 @@ class _OrderTicketCardState extends State<OrderTicketCard> {
                                       widget.order['customer_name'] ?? 'GUEST',
                                       style: const TextStyle(
                                         color: Color(0xFF8B949E),
-                                        fontSize: 12,
+                                        fontSize: 14,
                                         fontWeight: FontWeight.w500,
                                       ),
                                       overflow: TextOverflow.ellipsis,
@@ -1016,7 +1042,7 @@ class _OrderTicketCardState extends State<OrderTicketCard> {
                                                : isSoon ? const Color(0xFFFF9800)
                                                : const Color(0xFF2196F3))
                                             : const Color(0xFF8B949E),
-                                        fontSize: 8,
+                                        fontSize: 10,
                                         fontWeight: FontWeight.w600,
                                       ),
                                       overflow: TextOverflow.ellipsis,
